@@ -67,7 +67,7 @@ const HOOP = {
 };
 
 // ── 球的起始位置 ─────────────────────────────────────────────
-const ORIGIN = { x: 125, y: 408 };
+const ORIGIN = { x: 125, y: 375 };
 
 // ── 遊戲狀態 ─────────────────────────────────────────────────
 let ball      = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
@@ -83,7 +83,9 @@ let msgText  = '';
 let msgAlpha = 0;
 let msgColor = '#fff';
 
-let particles = [];
+let particles  = [];
+let throwPhase = 0;   // 0=持球姿勢, 1=出手跟隨
+let ballAlpha  = 1;   // 進框後淡出
 
 // ── 預先生成觀眾剪影（避免每幀 random 閃爍）─────────────────
 const crowd = [];
@@ -209,8 +211,8 @@ function update() {
             msgText  = streak >= 5 ? '超神了！🔥' : streak >= 3 ? '連續進球！' : '進球！';
             msgColor = '#44ff88';
             msgAlpha = 1.0;
-            state = 'paused';
-            setTimeout(resetBall, 1300);
+            ball.vx *= 0.12;   // 讓球幾乎垂直落下
+            state = 'netfall'; // 球穿越球網後淡出
             return;
         }
 
@@ -228,13 +230,36 @@ function update() {
         }
     }
 
+    // 球穿越球網後淡出
+    if (state === 'netfall') {
+        prevBallY = ball.y;
+        ball.x  += ball.vx;
+        ball.y  += ball.vy;
+        ball.vy += GRAVITY;
+        ball.vx *= 0.9;
+        ball.rot += ball.vx * 0.03;
+        if (ball.y > HOOP.rimY + 42) {
+            ballAlpha = Math.max(0, ballAlpha - 0.055);
+        }
+        if (ballAlpha <= 0) resetBall();
+    }
+
+    // 投籃動作動畫
+    if (state === 'flying' || state === 'netfall') {
+        throwPhase = Math.min(1, throwPhase + 0.07);
+    } else if (state === 'idle') {
+        throwPhase = Math.max(0, throwPhase - 0.04);
+    }
+
     updateParticles();
     if (msgAlpha > 0) msgAlpha = Math.max(0, msgAlpha - 0.016);
 }
 
 function resetBall() {
-    ball  = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
-    state = 'idle';
+    ball       = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
+    ballAlpha  = 1;
+    throwPhase = 0;
+    state      = 'idle';
 }
 
 // ── 繪圖 ─────────────────────────────────────────────────────
@@ -375,11 +400,12 @@ function drawNet(lx, rx, ry) {
 }
 
 function drawBall(x, y, rot) {
+    if (ballAlpha <= 0) return;
     // 地板投影
     const shadowY = H - 79;
     const sdist   = Math.max(0, 1 - (shadowY - y) / 350);
     ctx.save();
-    ctx.globalAlpha = 0.18 * sdist;
+    ctx.globalAlpha = 0.18 * sdist * ballAlpha;
     ctx.fillStyle = '#000';
     ctx.beginPath();
     ctx.ellipse(x, shadowY, BALL_R * 0.9, BALL_R * 0.28, 0, 0, Math.PI * 2);
@@ -387,6 +413,7 @@ function drawBall(x, y, rot) {
     ctx.restore();
 
     ctx.save();
+    ctx.globalAlpha = ballAlpha;
     ctx.translate(x, y);
     ctx.rotate(rot);
 
@@ -533,12 +560,151 @@ function drawParticles() {
     ctx.globalAlpha = 1;
 }
 
+// ── 人物繪製 ─────────────────────────────────────────────────
+function drawCharacter() {
+    const cx  = 92;
+    const fy  = H - 78;   // 地板 y = 412
+    const tp  = throwPhase;
+    const holding = (state === 'idle' || state === 'aiming');
+
+    ctx.save();
+    ctx.lineCap = 'round';
+
+    // ── 鞋子 ──────────────────────────────────────────────────
+    ctx.fillStyle = '#f0f0f0';
+    ctx.strokeStyle = '#aaa';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.ellipse(cx - 13, fy + 4, 14, 6, -0.12, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.ellipse(cx + 14, fy + 4, 13, 6, 0.12, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+
+    // ── 腿（深藍球褲）─────────────────────────────────────────
+    ctx.strokeStyle = '#1133cc';
+    ctx.lineWidth   = 8;
+    // 左腿
+    ctx.beginPath();
+    ctx.moveTo(cx - 5, fy - 30);
+    ctx.lineTo(cx - 13, fy);
+    ctx.stroke();
+    // 右腿
+    ctx.beginPath();
+    ctx.moveTo(cx + 6, fy - 30);
+    ctx.lineTo(cx + 14, fy);
+    ctx.stroke();
+
+    // ── 球褲 ──────────────────────────────────────────────────
+    ctx.fillStyle = '#1133cc';
+    ctx.beginPath();
+    ctx.moveTo(cx - 16, fy - 46);
+    ctx.lineTo(cx + 16, fy - 46);
+    ctx.lineTo(cx + 11, fy - 28);
+    ctx.lineTo(cx - 11, fy - 28);
+    ctx.closePath();
+    ctx.fill();
+
+    // ── 球衣（紅色）──────────────────────────────────────────
+    ctx.fillStyle = '#cc1111';
+    ctx.beginPath();
+    ctx.moveTo(cx - 17, fy - 78);
+    ctx.lineTo(cx + 17, fy - 78);
+    ctx.lineTo(cx + 14, fy - 45);
+    ctx.lineTo(cx - 14, fy - 45);
+    ctx.closePath();
+    ctx.fill();
+
+    // 球衣號碼
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('23', cx + 1, fy - 56);
+    ctx.textAlign = 'left';
+
+    // ── 頸部 ──────────────────────────────────────────────────
+    ctx.fillStyle = '#c8834a';
+    ctx.beginPath();
+    ctx.ellipse(cx, fy - 80, 5, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // ── 頭部 ──────────────────────────────────────────────────
+    const headY = fy - 96;
+    ctx.fillStyle = '#c8834a';
+    ctx.beginPath();
+    ctx.arc(cx, headY, 15, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 頭髮
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath();
+    ctx.arc(cx, headY, 14, Math.PI * 1.06, Math.PI * -0.03);
+    ctx.lineTo(cx, headY);
+    ctx.closePath();
+    ctx.fill();
+
+    // 眼睛（朝右看籃框）
+    ctx.fillStyle = '#222';
+    ctx.beginPath(); ctx.arc(cx + 3, headY + 2, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + 9, headY + 2, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(cx + 4, headY + 1, 1, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + 10, headY + 1, 1, 0, Math.PI * 2); ctx.fill();
+
+    // ── 左臂（非投球，配合跟隨動作）─────────────────────────
+    const lSX = cx - 15, lSY = fy - 76;
+    const lAng = Math.PI * 0.65 + tp * 0.45;
+    const lEX  = lSX + Math.cos(lAng) * 20;
+    const lEY  = lSY + Math.sin(lAng) * 20;
+    const lHX  = lEX + Math.cos(lAng + 0.5) * 17;
+    const lHY  = lEY + Math.sin(lAng + 0.5) * 17;
+
+    ctx.strokeStyle = '#c8834a';
+    ctx.lineWidth   = 5;
+    ctx.beginPath();
+    ctx.moveTo(lSX, lSY);
+    ctx.lineTo(lEX, lEY);
+    ctx.lineTo(lHX, lHY);
+    ctx.stroke();
+
+    // ── 右臂（投球臂）────────────────────────────────────────
+    const rSX = cx + 15, rSY = fy - 76;
+    let rUAng, rLAng;
+
+    if (holding) {
+        // 持球：手臂伸向 ORIGIN (球的位置)
+        const base = Math.atan2(ORIGIN.y - rSY, ORIGIN.x - rSX);
+        rUAng = base - 0.3;
+        rLAng = base + 0.2;
+    } else {
+        // 出手跟隨：手臂向右上舉
+        rUAng = -Math.PI * 0.52 + tp * (-0.28);
+        rLAng = -Math.PI * 0.08 + tp * (-0.45);
+    }
+
+    const rEX = rSX + Math.cos(rUAng) * 22;
+    const rEY = rSY + Math.sin(rUAng) * 22;
+    const rHX = rEX + Math.cos(rLAng) * 19;
+    const rHY = rEY + Math.sin(rLAng) * 19;
+
+    ctx.strokeStyle = '#c8834a';
+    ctx.lineWidth   = 5;
+    ctx.beginPath();
+    ctx.moveTo(rSX, rSY);
+    ctx.lineTo(rEX, rEY);
+    ctx.lineTo(rHX, rHY);
+    ctx.stroke();
+
+    ctx.restore();
+}
+
 // ── 主迴圈 ───────────────────────────────────────────────────
 function render() {
     ctx.clearRect(0, 0, W, H);
     drawBg();
     drawHoop();
     drawAiming();
+    drawCharacter();
     drawBall(ball.x, ball.y, ball.rot);
     drawParticles();
     drawHUD();
