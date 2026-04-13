@@ -87,12 +87,18 @@ let particles  = [];
 let throwPhase = 0;   // 0=持球姿勢, 1=出手跟隨
 let ballAlpha  = 1;   // 進框後淡出
 
+let netfallBounces    = 0;     // 已彈地次數
+let netfallMaxBounces = 0;     // 目標彈次（2-4 隨機）
+let netfallFading     = false; // 最後一彈後開始淡出
+
 // ── 預先生成觀眾剪影（避免每幀 random 閃爍）─────────────────
 const crowd = [];
 for (let i = 0; i < W; i += 22)
     crowd.push({ x: i, h: 28 + Math.sin(i * 0.18) * 14 + Math.random() * 8 });
 
 // ── 工具函式 ─────────────────────────────────────────────────
+const lerp = (a, b, t) => a + (b - a) * t;
+
 function getPos(e) {
     const r = canvas.getBoundingClientRect();
     return {
@@ -211,8 +217,11 @@ function update() {
             msgText  = streak >= 5 ? '超神了！🔥' : streak >= 3 ? '連續進球！' : '進球！';
             msgColor = '#44ff88';
             msgAlpha = 1.0;
-            ball.vx *= 0.12;   // 讓球幾乎垂直落下
-            state = 'netfall'; // 球穿越球網後淡出
+            netfallBounces    = 0;
+            netfallMaxBounces = 2 + Math.floor(Math.random() * 3); // 2~4 隨機
+            netfallFading     = false;
+            ball.vx *= 0.12;
+            state = 'netfall';
             return;
         }
 
@@ -230,18 +239,38 @@ function update() {
         }
     }
 
-    // 球穿越球網後淡出
+    // 球穿越球網後落地彈跳再淡出
     if (state === 'netfall') {
-        prevBallY = ball.y;
-        ball.x  += ball.vx;
-        ball.y  += ball.vy;
-        ball.vy += GRAVITY;
-        ball.vx *= 0.9;
-        ball.rot += ball.vx * 0.03;
-        if (ball.y > HOOP.rimY + 42) {
-            ballAlpha = Math.max(0, ballAlpha - 0.055);
+        if (netfallFading) {
+            ballAlpha = Math.max(0, ballAlpha - 0.042);
+            ball.x   += ball.vx;
+            ball.vx  *= 0.88;
+            ball.rot += ball.vx * 0.04;
+            if (ballAlpha <= 0) resetBall();
+        } else {
+            ball.x  += ball.vx;
+            ball.y  += ball.vy;
+            ball.vy += GRAVITY;
+            ball.vx *= 0.994;
+            ball.rot += (ball.vy > 0 ? 0.05 : -0.01);
+
+            const floorHitY = (H - 78) - BALL_R;
+            if (ball.y >= floorHitY && ball.vy > 0) {
+                ball.y = floorHitY;
+                netfallBounces++;
+                if (netfallBounces >= netfallMaxBounces) {
+                    netfallFading = true;
+                    ball.vy = 0;
+                    ball.vx *= 0.35;
+                } else {
+                    // 彈跳：每次高度遞減 + 少許隨機性
+                    const restitution = 0.52 + Math.random() * 0.10;
+                    ball.vy = -Math.abs(ball.vy) * restitution;
+                    ball.vx *= 0.65;
+                }
+            }
+            if (ball.x > W + 80 || ball.x < -80) netfallFading = true;
         }
-        if (ballAlpha <= 0) resetBall();
     }
 
     // 投籃動作動畫
@@ -256,10 +285,13 @@ function update() {
 }
 
 function resetBall() {
-    ball       = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
-    ballAlpha  = 1;
-    throwPhase = 0;
-    state      = 'idle';
+    ball              = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
+    ballAlpha         = 1;
+    throwPhase        = 0;
+    netfallBounces    = 0;
+    netfallMaxBounces = 0;
+    netfallFading     = false;
+    state             = 'idle';
 }
 
 // ── 繪圖 ─────────────────────────────────────────────────────
@@ -560,135 +592,175 @@ function drawParticles() {
     ctx.globalAlpha = 1;
 }
 
+// ── 手臂 IK 求解（讓手臂自然伸向目標）──────────────────────
+function solveIK(sx, sy, tx, ty, L1, L2, elbowCCW = false) {
+    const dx  = tx - sx, dy = ty - sy;
+    let   D   = Math.hypot(dx, dy);
+    const ang = Math.atan2(dy, dx);
+    D = Math.min(L1 + L2 - 0.5, Math.max(Math.abs(L1 - L2) + 0.5, D));
+    const cosA  = (D*D + L1*L1 - L2*L2) / (2 * D * L1);
+    const alpha = Math.acos(Math.max(-1, Math.min(1, cosA)));
+    const uA    = elbowCCW ? ang + alpha : ang - alpha;
+    return { ex: sx + Math.cos(uA)*L1, ey: sy + Math.sin(uA)*L1 };
+}
+
 // ── 人物繪製 ─────────────────────────────────────────────────
 function drawCharacter() {
-    const cx  = 92;
-    const fy  = H - 78;   // 地板 y = 412
-    const tp  = throwPhase;
-    const holding = (state === 'idle' || state === 'aiming');
+    const cx      = 90;
+    const fy      = H - 78;          // 地板 y = 412
+    const tp      = throwPhase;      // 0 持球 → 1 出手完成
+    const holding = state === 'idle' || state === 'aiming';
+
+    // 身體隨出手動作向前傾
+    const lean   = tp * 9;
+    // 膝蓋隨蓄力微彎（aiming 時透過 dragEnd 距離感知）
+    const kBend  = tp * 5;
 
     ctx.save();
-    ctx.lineCap = 'round';
+    ctx.lineCap  = 'round';
+    ctx.lineJoin = 'round';
 
     // ── 鞋子 ──────────────────────────────────────────────────
-    ctx.fillStyle = '#f0f0f0';
-    ctx.strokeStyle = '#aaa';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.ellipse(cx - 13, fy + 4, 14, 6, -0.12, 0, Math.PI * 2);
-    ctx.fill(); ctx.stroke();
-    ctx.beginPath();
-    ctx.ellipse(cx + 14, fy + 4, 13, 6, 0.12, 0, Math.PI * 2);
-    ctx.fill(); ctx.stroke();
+    const shoeData = [[-14, -0.10], [+15, 0.10]];
+    for (const [ox, tilt] of shoeData) {
+        const sx = cx + ox + lean * 0.3;
+        ctx.fillStyle   = '#f2f2f2';
+        ctx.strokeStyle = '#bbb';
+        ctx.lineWidth   = 1;
+        ctx.beginPath();
+        ctx.ellipse(sx, fy + 4, 14, 6, tilt, 0, Math.PI * 2);
+        ctx.fill(); ctx.stroke();
+        // 紅色品牌條紋
+        ctx.strokeStyle = '#cc1111';
+        ctx.lineWidth   = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(sx - 7, fy + 2.5);
+        ctx.lineTo(sx + 6, fy + 0.5);
+        ctx.stroke();
+    }
 
-    // ── 腿（深藍球褲）─────────────────────────────────────────
-    ctx.strokeStyle = '#1133cc';
-    ctx.lineWidth   = 8;
+    // ── 腿（quadratic curve 給膝蓋微彎感）─────────────────────
+    ctx.strokeStyle = '#1a3acc';
+    ctx.lineWidth   = 9;
+    const hipX = cx + lean * 0.55, hipY = fy - 38;
     // 左腿
     ctx.beginPath();
-    ctx.moveTo(cx - 5, fy - 30);
-    ctx.lineTo(cx - 13, fy);
+    ctx.moveTo(hipX - 5, hipY);
+    ctx.quadraticCurveTo(cx - 16 + lean * 0.4 + kBend, fy - 18,
+                         cx - 14 + lean * 0.28, fy);
     ctx.stroke();
     // 右腿
     ctx.beginPath();
-    ctx.moveTo(cx + 6, fy - 30);
-    ctx.lineTo(cx + 14, fy);
+    ctx.moveTo(hipX + 6, hipY);
+    ctx.quadraticCurveTo(cx + 16 + lean * 0.4 - kBend, fy - 18,
+                         cx + 15 + lean * 0.28, fy);
     ctx.stroke();
 
     // ── 球褲 ──────────────────────────────────────────────────
-    ctx.fillStyle = '#1133cc';
+    ctx.fillStyle = '#1a3acc';
     ctx.beginPath();
-    ctx.moveTo(cx - 16, fy - 46);
-    ctx.lineTo(cx + 16, fy - 46);
-    ctx.lineTo(cx + 11, fy - 28);
-    ctx.lineTo(cx - 11, fy - 28);
+    ctx.moveTo(cx - 17 + lean, fy - 52);
+    ctx.lineTo(cx + 17 + lean, fy - 52);
+    ctx.lineTo(cx + 11 + lean * 0.6, fy - 36);
+    ctx.lineTo(cx - 11 + lean * 0.6, fy - 36);
     ctx.closePath();
     ctx.fill();
 
-    // ── 球衣（紅色）──────────────────────────────────────────
+    // ── 球衣 ──────────────────────────────────────────────────
+    const bx = cx + lean;
     ctx.fillStyle = '#cc1111';
     ctx.beginPath();
-    ctx.moveTo(cx - 17, fy - 78);
-    ctx.lineTo(cx + 17, fy - 78);
-    ctx.lineTo(cx + 14, fy - 45);
-    ctx.lineTo(cx - 14, fy - 45);
+    ctx.moveTo(bx - 17, fy - 86);
+    ctx.lineTo(bx + 17, fy - 86);
+    ctx.lineTo(bx + 13, fy - 50);
+    ctx.lineTo(bx - 13, fy - 50);
     ctx.closePath();
     ctx.fill();
-
     // 球衣號碼
-    ctx.fillStyle = '#fff';
-    ctx.font = 'bold 13px Arial';
-    ctx.textAlign = 'center';
-    ctx.fillText('23', cx + 1, fy - 56);
-    ctx.textAlign = 'left';
+    ctx.fillStyle   = '#fff';
+    ctx.font        = 'bold 14px Arial';
+    ctx.textAlign   = 'center';
+    ctx.fillText('23', bx + 1, fy - 63);
+    ctx.textAlign   = 'left';
 
     // ── 頸部 ──────────────────────────────────────────────────
     ctx.fillStyle = '#c8834a';
     ctx.beginPath();
-    ctx.ellipse(cx, fy - 80, 5, 8, 0, 0, Math.PI * 2);
+    ctx.ellipse(bx, fy - 88, 5, 8, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // ── 頭部 ──────────────────────────────────────────────────
-    const headY = fy - 96;
+    // ── 頭部（出手後微微後仰，眼睛追蹤球）──────────────────
+    const headX   = bx + 2;
+    const headY   = fy - 105 + tp * 2;
+    const eyeRise = tp * 3;   // 出手後眼睛往上看
+
     ctx.fillStyle = '#c8834a';
     ctx.beginPath();
-    ctx.arc(cx, headY, 15, 0, Math.PI * 2);
+    ctx.arc(headX, headY, 15, 0, Math.PI * 2);
     ctx.fill();
 
     // 頭髮
     ctx.fillStyle = '#1a1a1a';
     ctx.beginPath();
-    ctx.arc(cx, headY, 14, Math.PI * 1.06, Math.PI * -0.03);
-    ctx.lineTo(cx, headY);
+    ctx.arc(headX, headY, 14.5, Math.PI * 1.05, Math.PI * -0.02);
+    ctx.lineTo(headX, headY);
     ctx.closePath();
     ctx.fill();
 
-    // 眼睛（朝右看籃框）
+    // 眼睛
     ctx.fillStyle = '#222';
-    ctx.beginPath(); ctx.arc(cx + 3, headY + 2, 2.5, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(cx + 9, headY + 2, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(headX + 3, headY - eyeRise + 2, 2.5, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(headX + 9, headY - eyeRise + 2, 2.5, 0, Math.PI*2); ctx.fill();
     ctx.fillStyle = '#fff';
-    ctx.beginPath(); ctx.arc(cx + 4, headY + 1, 1, 0, Math.PI * 2); ctx.fill();
-    ctx.beginPath(); ctx.arc(cx + 10, headY + 1, 1, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(headX + 4, headY - eyeRise + 1, 1.1, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(headX + 10, headY - eyeRise + 1, 1.1, 0, Math.PI*2); ctx.fill();
 
-    // ── 左臂（非投球，配合跟隨動作）─────────────────────────
-    const lSX = cx - 15, lSY = fy - 76;
-    const lAng = Math.PI * 0.65 + tp * 0.45;
-    const lEX  = lSX + Math.cos(lAng) * 20;
-    const lEY  = lSY + Math.sin(lAng) * 20;
-    const lHX  = lEX + Math.cos(lAng + 0.5) * 17;
-    const lHY  = lEY + Math.sin(lAng + 0.5) * 17;
+    // ── 左臂（平衡臂）────────────────────────────────────────
+    const lSX = bx - 16, lSY = fy - 83;
+    // holding: 輕微向前下托住球；follow-through: 向外後伸保持平衡
+    const lUAng = holding
+        ? lerp(Math.PI * 0.68, Math.PI * 0.58, tp)
+        : lerp(Math.PI * 0.68, Math.PI * 0.85, tp);
+    const lLAng = lUAng - 0.42;
+    const lEX = lSX + Math.cos(lUAng) * 22;
+    const lEY = lSY + Math.sin(lUAng) * 22;
+    const lHX = lEX + Math.cos(lLAng) * 18;
+    const lHY = lEY + Math.sin(lLAng) * 18;
 
     ctx.strokeStyle = '#c8834a';
-    ctx.lineWidth   = 5;
+    ctx.lineWidth   = 6;
     ctx.beginPath();
     ctx.moveTo(lSX, lSY);
     ctx.lineTo(lEX, lEY);
     ctx.lineTo(lHX, lHY);
     ctx.stroke();
 
-    // ── 右臂（投球臂）────────────────────────────────────────
-    const rSX = cx + 15, rSY = fy - 76;
-    let rUAng, rLAng;
+    // ── 右臂（投球臂，IK 精準持球 + lerp 到出手姿勢）────────
+    const rSX = bx + 16, rSY = fy - 84;
+    const L1 = 24, L2 = 21;
 
-    if (holding) {
-        // 持球：手臂伸向 ORIGIN (球的位置)
-        const base = Math.atan2(ORIGIN.y - rSY, ORIGIN.x - rSX);
-        rUAng = base - 0.3;
-        rLAng = base + 0.2;
-    } else {
-        // 出手跟隨：手臂向右上舉
-        rUAng = -Math.PI * 0.52 + tp * (-0.28);
-        rLAng = -Math.PI * 0.08 + tp * (-0.45);
-    }
+    // --- 持球姿勢：IK 讓手抵達 ORIGIN ---
+    const ik = solveIK(rSX, rSY, ORIGIN.x, ORIGIN.y, L1, L2, false);
+    const hold_eX = ik.ex, hold_eY = ik.ey;
+    const hold_hX = ORIGIN.x, hold_hY = ORIGIN.y;
 
-    const rEX = rSX + Math.cos(rUAng) * 22;
-    const rEY = rSY + Math.sin(rUAng) * 22;
-    const rHX = rEX + Math.cos(rLAng) * 19;
-    const rHY = rEY + Math.sin(rLAng) * 19;
+    // --- 出手姿勢：手臂向右上完全舒展 ---
+    const ftUA  = -Math.PI * 0.50;
+    const ftLA  = -Math.PI * 0.22;
+    const ft_eX = rSX + Math.cos(ftUA) * L1;
+    const ft_eY = rSY + Math.sin(ftUA) * L1;
+    const ft_hX = ft_eX + Math.cos(ftLA) * L2;
+    const ft_hY = ft_eY + Math.sin(ftLA) * L2;
+
+    // 用 smoothstep 讓動作曲線更自然
+    const s   = tp * tp * (3 - 2 * tp);
+    const rEX = lerp(hold_eX, ft_eX, s);
+    const rEY = lerp(hold_eY, ft_eY, s);
+    const rHX = lerp(hold_hX, ft_hX, s);
+    const rHY = lerp(hold_hY, ft_hY, s);
 
     ctx.strokeStyle = '#c8834a';
-    ctx.lineWidth   = 5;
+    ctx.lineWidth   = 6;
     ctx.beginPath();
     ctx.moveTo(rSX, rSY);
     ctx.lineTo(rEX, rEY);
