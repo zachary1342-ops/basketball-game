@@ -27,8 +27,6 @@
             border: 2px solid #ff8c00;
             border-radius: 8px;
             box-shadow: 0 0 24px rgba(255,140,0,0.25);
-            cursor: crosshair;
-            touch-action: none;
             display: block;
         }
         #sub {
@@ -41,57 +39,93 @@
 <body>
     <h1>🏀 籃球投射遊戲</h1>
     <canvas id="c"></canvas>
-    <div id="sub">點住籃球朝籃框方向拖曳，放開即可投出</div>
+    <div id="sub">← → 移動　↑ 跳躍　空白鍵按住蓄力、放開投籃</div>
 
 <script>
 const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
+const ctx    = canvas.getContext('2d');
 const W = canvas.width  = 800;
 const H = canvas.height = 490;
 
 // ── 物理常數 ──────────────────────────────────────────────────
 const GRAVITY   = 0.38;
 const BALL_R    = 18;
-const MAX_DRAG  = 185;
-const MAX_SPEED = 21;
+const MAX_SPEED = 24;
+const FLOOR_Y   = H - 78; // = 412
 
 // ── 籃框幾何 ─────────────────────────────────────────────────
 const HOOP = {
-    rimY:   258,
-    leftX:  622,
-    rightX: 698,
-    rimR:   7,
-    backX:  716,
+    rimY:    258,
+    leftX:   622,
+    rightX:  698,
+    rimR:    7,
+    backX:   716,
     backTop: 175,
     backBot: 335,
 };
 
-// ── 球的起始位置 ─────────────────────────────────────────────
-const ORIGIN = { x: 125, y: 375 };
+// ── 玩家狀態 ─────────────────────────────────────────────────
+let player = {
+    x:          90,    // 腳的水平位置
+    jumpOffset: 0,     // 跳躍垂直偏移（0=地面, 負=空中）
+    jumpVy:     0,
+    onGround:   true,
+};
+const PLAYER_MOVE_SPEED = 4;
+const PLAYER_JUMP_VY    = -11;
+const PLAYER_MIN_X      = 15;
+const PLAYER_MAX_X      = 540;
+
+// ── 球 ───────────────────────────────────────────────────────
+let ball      = { x: 0, y: 0, vx: 0, vy: 0, rot: 0 };
+let prevBallY = 0;
+let ballAlpha = 1;
 
 // ── 遊戲狀態 ─────────────────────────────────────────────────
-let ball      = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
-let state     = 'idle';   // idle | aiming | flying | paused
-let dragEnd   = null;
-let prevBallY = ORIGIN.y;
+let state      = 'idle';  // idle | charging | flying | paused | netfall
+let throwPhase = 0;
 
-let score   = 0;
+// ── 蓄力 ─────────────────────────────────────────────────────
+let shootPower = 0;
+let powerDir   = 1;       // 1=充能 -1=放電（振盪）
+const POWER_SPEED = 1 / 55; // 55 幀充滿
+
+// ── 分數 ─────────────────────────────────────────────────────
+let score    = 0;
 let attempts = 0;
-let streak  = 0;
-
+let streak   = 0;
 let msgText  = '';
 let msgAlpha = 0;
 let msgColor = '#fff';
 
-let particles  = [];
-let throwPhase = 0;   // 0=持球姿勢, 1=出手跟隨
-let ballAlpha  = 1;   // 進框後淡出
+let particles          = [];
+let netfallBounces     = 0;
+let netfallMaxBounces  = 0;
+let netfallFading      = false;
 
-let netfallBounces    = 0;     // 已彈地次數
-let netfallMaxBounces = 0;     // 目標彈次（2-4 隨機）
-let netfallFading     = false; // 最後一彈後開始淡出
+// ── 鍵盤狀態 ─────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+    if (['Space', 'ArrowLeft', 'ArrowRight', 'ArrowUp'].includes(e.code)) {
+        e.preventDefault();
+    }
+    // 按下空白鍵開始蓄力（只在 idle 觸發一次）
+    if (!keys[e.code] && e.code === 'Space' && state === 'idle') {
+        state      = 'charging';
+        shootPower = 0;
+        powerDir   = 1;
+    }
+    keys[e.code] = true;
+});
+document.addEventListener('keyup', e => {
+    keys[e.code] = false;
+    // 放開空白鍵投籃
+    if (e.code === 'Space' && state === 'charging') {
+        shoot();
+    }
+});
 
-// ── 預先生成觀眾剪影（避免每幀 random 閃爍）─────────────────
+// ── 預先生成觀眾剪影 ─────────────────────────────────────────
 const crowd = [];
 for (let i = 0; i < W; i += 22)
     crowd.push({ x: i, h: 28 + Math.sin(i * 0.18) * 14 + Math.random() * 8 });
@@ -99,29 +133,49 @@ for (let i = 0; i < W; i += 22)
 // ── 工具函式 ─────────────────────────────────────────────────
 const lerp = (a, b, t) => a + (b - a) * t;
 
-function getPos(e) {
-    const r = canvas.getBoundingClientRect();
-    return {
-        x: (e.clientX - r.left) * (W / r.width),
-        y: (e.clientY - r.top)  * (H / r.height),
-    };
+function getHandPos() {
+    const fy = FLOOR_Y + player.jumpOffset;
+    return { x: player.x + 35, y: fy - 37 };
 }
 
-function dragVelocity() {
-    if (!dragEnd) return { vx: 0, vy: 0 };
-    // 直接瞄準：拖曳方向即發射方向
-    const dx = dragEnd.x - ORIGIN.x;
-    const dy = dragEnd.y - ORIGIN.y;
-    const len = Math.min(Math.hypot(dx, dy), MAX_DRAG);
-    if (len < 4) return { vx: 0, vy: 0 };
-    const ang   = Math.atan2(dy, dx);
-    const speed = (len / MAX_DRAG) * MAX_SPEED;
-    return { vx: Math.cos(ang) * speed, vy: Math.sin(ang) * speed };
+// 計算當前位置的理想力道比例（0-1）
+function computeIdealPower() {
+    const hand  = getHandPos();
+    const T     = 42;
+    const hoopX = (HOOP.leftX + HOOP.rightX) / 2;
+    const vx    = (hoopX - hand.x) / T;
+    const vy    = (HOOP.rimY - hand.y - 0.5 * GRAVITY * T * T) / T;
+    return Math.min(1, Math.max(0.1, Math.hypot(vx, vy) / MAX_SPEED));
 }
 
-function predictPath(vx, vy) {
-    const pts = [];
-    let x = ORIGIN.x, y = ORIGIN.y, dvx = vx, dvy = vy;
+// 根據蓄力計算投出速度
+function computeShootVel() {
+    const hand    = getHandPos();
+    const T       = 42;
+    const hoopX   = (HOOP.leftX + HOOP.rightX) / 2;
+    const vx      = (hoopX - hand.x) / T;
+    const vy      = (HOOP.rimY - hand.y - 0.5 * GRAVITY * T * T) / T;
+    const idealSp = Math.hypot(vx, vy);
+    if (idealSp < 0.01) return { vx: 0, vy: -2 };
+    const scale = (shootPower * MAX_SPEED) / idealSp;
+    return { vx: vx * scale, vy: vy * scale };
+}
+
+function shoot() {
+    const vel  = computeShootVel();
+    ball.vx    = vel.vx;
+    ball.vy    = vel.vy;
+    prevBallY  = ball.y;
+    state      = 'flying';
+    shootPower = 0;
+    powerDir   = 1;
+}
+
+function predictPath() {
+    const vel  = computeShootVel();
+    const hand = getHandPos();
+    const pts  = [];
+    let x = hand.x, y = hand.y, dvx = vel.vx, dvy = vel.vy;
     for (let i = 0; i < 110; i++) {
         x += dvx; y += dvy; dvy += GRAVITY;
         if (y > H + 30) break;
@@ -181,17 +235,16 @@ function checkRimCollision() {
         ball.y >= HOOP.backTop - BALL_R &&
         ball.y <= HOOP.backBot + BALL_R &&
         ball.vx > 0) {
-        ball.x  = HOOP.backX - BALL_R;
+        ball.x   = HOOP.backX - BALL_R;
         ball.vx *= -0.42;
     }
 }
 
 function checkScore() {
-    // 球從上方穿過籃框水平面
     if (prevBallY < HOOP.rimY && ball.y >= HOOP.rimY && ball.vy > 0) {
         const t      = (HOOP.rimY - prevBallY) / (ball.y - prevBallY);
         const crossX = (ball.x - ball.vx) + t * ball.vx;
-        const inner  = 4; // 小容差
+        const inner  = 4;
         if (crossX > HOOP.leftX  + HOOP.rimR + inner &&
             crossX < HOOP.rightX - HOOP.rimR - inner) {
             return true;
@@ -200,8 +253,51 @@ function checkScore() {
     return false;
 }
 
-// ── 更新 ─────────────────────────────────────────────────────
+// ── 玩家更新 ─────────────────────────────────────────────────
+function updatePlayer() {
+    // 水平移動（閒置、蓄力、暫停時均可移動）
+    if (state === 'idle' || state === 'charging' || state === 'paused') {
+        if (keys['ArrowLeft'])  player.x = Math.max(PLAYER_MIN_X, player.x - PLAYER_MOVE_SPEED);
+        if (keys['ArrowRight']) player.x = Math.min(PLAYER_MAX_X, player.x + PLAYER_MOVE_SPEED);
+    }
+
+    // 跳躍（閒置或蓄力時可跳，且在地面上）
+    if (keys['ArrowUp'] && player.onGround &&
+        (state === 'idle' || state === 'charging')) {
+        player.jumpVy   = PLAYER_JUMP_VY;
+        player.onGround = false;
+    }
+
+    // 跳躍物理
+    if (!player.onGround) {
+        player.jumpOffset += player.jumpVy;
+        player.jumpVy     += GRAVITY;
+        if (player.jumpOffset >= 0) {
+            player.jumpOffset = 0;
+            player.jumpVy     = 0;
+            player.onGround   = true;
+        }
+    }
+
+    // 球跟隨手部（靜止/蓄力時）
+    if (state === 'idle' || state === 'charging') {
+        const hand = getHandPos();
+        ball.x = hand.x;
+        ball.y = hand.y;
+    }
+
+    // 蓄力振盪
+    if (state === 'charging') {
+        shootPower += POWER_SPEED * powerDir;
+        if (shootPower >= 1) { shootPower = 1; powerDir = -1; }
+        if (shootPower <= 0) { shootPower = 0; powerDir =  1; }
+    }
+}
+
+// ── 主更新 ───────────────────────────────────────────────────
 function update() {
+    updatePlayer();
+
     if (state === 'flying') {
         prevBallY = ball.y;
         ball.x  += ball.vx;
@@ -218,7 +314,7 @@ function update() {
             msgColor = '#44ff88';
             msgAlpha = 1.0;
             netfallBounces    = 0;
-            netfallMaxBounces = 2 + Math.floor(Math.random() * 3); // 2~4 隨機
+            netfallMaxBounces = 2 + Math.floor(Math.random() * 3);
             netfallFading     = false;
             ball.vx *= 0.12;
             state = 'netfall';
@@ -227,19 +323,17 @@ function update() {
 
         checkRimCollision();
 
-        const floorY = H - 78;
-        if (ball.y > floorY + BALL_R || ball.x > W + 80 || ball.x < -80) {
+        if (ball.y > FLOOR_Y + BALL_R || ball.x > W + 80 || ball.x < -80) {
             attempts++;
-            streak  = 0;
+            streak   = 0;
             msgText  = '沒進！';
             msgColor = '#ff6644';
             msgAlpha = 1.0;
-            state = 'paused';
+            state    = 'paused';
             setTimeout(resetBall, 1050);
         }
     }
 
-    // 球穿越球網後落地彈跳再淡出
     if (state === 'netfall') {
         if (netfallFading) {
             ballAlpha = Math.max(0, ballAlpha - 0.042);
@@ -254,7 +348,7 @@ function update() {
             ball.vx *= 0.994;
             ball.rot += (ball.vy > 0 ? 0.05 : -0.01);
 
-            const floorHitY = (H - 78) - BALL_R;
+            const floorHitY = FLOOR_Y - BALL_R;
             if (ball.y >= floorHitY && ball.vy > 0) {
                 ball.y = floorHitY;
                 netfallBounces++;
@@ -263,7 +357,6 @@ function update() {
                     ball.vy = 0;
                     ball.vx *= 0.35;
                 } else {
-                    // 彈跳：每次高度遞減 + 少許隨機性
                     const restitution = 0.52 + Math.random() * 0.10;
                     ball.vy = -Math.abs(ball.vy) * restitution;
                     ball.vx *= 0.65;
@@ -273,10 +366,9 @@ function update() {
         }
     }
 
-    // 投籃動作動畫
     if (state === 'flying' || state === 'netfall') {
         throwPhase = Math.min(1, throwPhase + 0.07);
-    } else if (state === 'idle') {
+    } else if (state === 'idle' || state === 'charging' || state === 'paused') {
         throwPhase = Math.max(0, throwPhase - 0.04);
     }
 
@@ -285,7 +377,8 @@ function update() {
 }
 
 function resetBall() {
-    ball              = { x: ORIGIN.x, y: ORIGIN.y, vx: 0, vy: 0, rot: 0 };
+    const hand        = getHandPos();
+    ball              = { x: hand.x, y: hand.y, vx: 0, vy: 0, rot: 0 };
     ballAlpha         = 1;
     throwPhase        = 0;
     netfallBounces    = 0;
@@ -296,63 +389,52 @@ function resetBall() {
 
 // ── 繪圖 ─────────────────────────────────────────────────────
 function drawBg() {
-    // 深色球場背景
     const bg = ctx.createLinearGradient(0, 0, 0, H);
     bg.addColorStop(0, '#0e0e20');
     bg.addColorStop(1, '#1c1c38');
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, W, H);
 
-    // 觀眾剪影
     ctx.fillStyle = '#0a0a18';
     for (const c of crowd) ctx.fillRect(c.x, 0, 20, c.h);
 
-    // 木質球場地板
-    const floorY = H - 78;
-    const floor  = ctx.createLinearGradient(0, floorY, 0, H);
+    const floor = ctx.createLinearGradient(0, FLOOR_Y, 0, H);
     floor.addColorStop(0, '#c47c2e');
     floor.addColorStop(1, '#8c4c10');
     ctx.fillStyle = floor;
-    ctx.fillRect(0, floorY, W, H - floorY);
+    ctx.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
 
-    // 地板分隔線
     ctx.strokeStyle = 'rgba(160,90,20,0.55)';
     ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(0, floorY); ctx.lineTo(W, floorY); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, FLOOR_Y); ctx.lineTo(W, FLOOR_Y); ctx.stroke();
 
-    // 三分線弧
     ctx.strokeStyle = 'rgba(160,90,20,0.35)';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(60, floorY, 295, -Math.PI * 0.72, 0);
+    ctx.arc(60, FLOOR_Y, 295, -Math.PI * 0.72, 0);
     ctx.stroke();
 
-    // 禁區
     ctx.fillStyle = 'rgba(130,60,10,0.28)';
-    ctx.fillRect(60, floorY - 118, 195, 118);
+    ctx.fillRect(60, FLOOR_Y - 118, 195, 118);
     ctx.strokeStyle = 'rgba(160,90,20,0.38)';
     ctx.lineWidth = 2;
-    ctx.strokeRect(60, floorY - 118, 195, 118);
+    ctx.strokeRect(60, FLOOR_Y - 118, 195, 118);
 
-    // 罰球圈
     ctx.strokeStyle = 'rgba(160,90,20,0.35)';
     ctx.beginPath();
-    ctx.arc(157, floorY - 118, 55, Math.PI, 0);
+    ctx.arc(157, FLOOR_Y - 118, 55, Math.PI, 0);
     ctx.stroke();
 }
 
 function drawHoop() {
     const { rimY, leftX, rightX, rimR, backX, backTop, backBot } = HOOP;
 
-    // 柱子
     ctx.fillStyle = '#6a6a6a';
-    ctx.fillRect(backX + 3, backBot, 10, H - 78 - backBot);
+    ctx.fillRect(backX + 3, backBot, 10, FLOOR_Y - backBot);
 
-    // 後板陰影
     ctx.fillStyle = 'rgba(0,0,0,0.35)';
     ctx.fillRect(backX + 5, backTop + 5, 18, backBot - backTop);
 
-    // 後板
     const bbg = ctx.createLinearGradient(backX, 0, backX + 18, 0);
     bbg.addColorStop(0, '#ccc');
     bbg.addColorStop(1, '#eee');
@@ -362,12 +444,10 @@ function drawHoop() {
     ctx.lineWidth = 2;
     ctx.strokeRect(backX, backTop, 18, backBot - backTop);
 
-    // 後板紅色框
     ctx.strokeStyle = '#dd2222';
     ctx.lineWidth = 2;
     ctx.strokeRect(backX, rimY - 8, 18, 48);
 
-    // 連接臂
     ctx.strokeStyle = '#888';
     ctx.lineWidth = 4;
     ctx.beginPath();
@@ -375,10 +455,8 @@ function drawHoop() {
     ctx.lineTo(rightX, rimY);
     ctx.stroke();
 
-    // 球網
     drawNet(leftX, rightX, rimY);
 
-    // 籃框
     ctx.strokeStyle = '#ff6600';
     ctx.lineWidth = 6;
     ctx.lineCap = 'round';
@@ -388,7 +466,6 @@ function drawHoop() {
     ctx.stroke();
     ctx.lineCap = 'butt';
 
-    // 框端圓頭
     for (const rx of [leftX, rightX]) {
         ctx.fillStyle   = '#ff6600';
         ctx.strokeStyle = '#cc4400';
@@ -405,21 +482,18 @@ function drawNet(lx, rx, ry) {
     ctx.strokeStyle = 'rgba(210,210,210,0.62)';
     ctx.lineWidth   = 1;
 
-    // 頂部橫線
     ctx.beginPath(); ctx.moveTo(lx, ry + 3); ctx.lineTo(rx, ry + 3); ctx.stroke();
 
-    // 縱線
     for (let i = 0; i <= segs; i++) {
-        const t   = i / segs;
-        const tx  = lx + (rx - lx) * t;
-        const bx  = lx + (rx - lx) * 0.5 + (tx - (lx + (rx - lx) * 0.5)) * 0.5;
+        const t  = i / segs;
+        const tx = lx + (rx - lx) * t;
+        const bx = lx + (rx - lx) * 0.5 + (tx - (lx + (rx - lx) * 0.5)) * 0.5;
         ctx.beginPath();
         ctx.moveTo(tx, ry + 3);
         ctx.lineTo(bx, ry + netH);
         ctx.stroke();
     }
 
-    // 橫向網紋
     for (let row = 1; row <= 3; row++) {
         const ft  = row / 4;
         const y   = ry + 3 + netH * ft;
@@ -433,8 +507,7 @@ function drawNet(lx, rx, ry) {
 
 function drawBall(x, y, rot) {
     if (ballAlpha <= 0) return;
-    // 地板投影
-    const shadowY = H - 79;
+    const shadowY = FLOOR_Y - 1;
     const sdist   = Math.max(0, 1 - (shadowY - y) / 350);
     ctx.save();
     ctx.globalAlpha = 0.18 * sdist * ballAlpha;
@@ -449,7 +522,6 @@ function drawBall(x, y, rot) {
     ctx.translate(x, y);
     ctx.rotate(rot);
 
-    // 球體漸層
     const g = ctx.createRadialGradient(-5, -6, 2, 0, 0, BALL_R);
     g.addColorStop(0,   '#ffb347');
     g.addColorStop(0.5, '#e05c0a');
@@ -459,15 +531,13 @@ function drawBall(x, y, rot) {
     ctx.arc(0, 0, BALL_R, 0, Math.PI * 2);
     ctx.fill();
 
-    // 縫線
     ctx.strokeStyle = 'rgba(80,15,0,0.5)';
     ctx.lineWidth   = 1.5;
     ctx.beginPath(); ctx.arc(0, 0, BALL_R, 0.15, Math.PI - 0.15); ctx.stroke();
     ctx.beginPath(); ctx.arc(0, 0, BALL_R, Math.PI + 0.15, -0.15); ctx.stroke();
-    ctx.beginPath(); ctx.arc(0, 0, BALL_R * 0.62, -Math.PI*0.5+0.1, Math.PI*0.5-0.1); ctx.stroke();
-    ctx.beginPath(); ctx.arc(0, 0, BALL_R * 0.62,  Math.PI*0.5+0.1, Math.PI*1.5-0.1); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, BALL_R * 0.62, -Math.PI*0.5+0.1,  Math.PI*0.5-0.1); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, BALL_R * 0.62,  Math.PI*0.5+0.1,  Math.PI*1.5-0.1); ctx.stroke();
 
-    // 反光
     ctx.fillStyle = 'rgba(255,215,140,0.32)';
     ctx.beginPath();
     ctx.ellipse(-5, -7, 7, 4, -0.5, 0, Math.PI * 2);
@@ -477,13 +547,10 @@ function drawBall(x, y, rot) {
 }
 
 function drawAiming() {
-    if (state !== 'aiming' || !dragEnd) return;
-    const vel   = dragVelocity();
-    const speed = Math.hypot(vel.vx, vel.vy);
-    if (speed < 0.5) return;
+    if (state !== 'charging') return;
 
-    // 軌跡預覽點
-    const pts = predictPath(vel.vx, vel.vy);
+    // 軌跡預覽（隨蓄力即時更新）
+    const pts = predictPath();
     for (let i = 2; i < pts.length; i += 4) {
         const alpha = (1 - i / pts.length) * 0.85;
         const r     = 3.8 * (1 - i / pts.length * 0.5);
@@ -495,41 +562,34 @@ function drawAiming() {
     }
     ctx.globalAlpha = 1;
 
-    // 瞄準方向箭頭（與發射方向相同）
-    const dx  = dragEnd.x - ORIGIN.x;
-    const dy  = dragEnd.y - ORIGIN.y;
-    const len = Math.min(Math.hypot(dx, dy), MAX_DRAG);
-    const nx  = dx / (Math.hypot(dx, dy) || 1);
-    const ny  = dy / (Math.hypot(dx, dy) || 1);
-    const ex  = ORIGIN.x + nx * len;
-    const ey  = ORIGIN.y + ny * len;
-
-    ctx.strokeStyle = 'rgba(255,100,100,0.65)';
-    ctx.lineWidth   = 2;
-    ctx.setLineDash([7, 5]);
-    ctx.beginPath();
-    ctx.moveTo(ORIGIN.x, ORIGIN.y);
-    ctx.lineTo(ex, ey);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
     // 力道條
-    const power = len / MAX_DRAG;
-    const bx = 16, by = H - 36, bw = 135, bh = 14;
-    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    const bx = 16, by = H - 36, bw = 155, bh = 14;
+    const idealPow = computeIdealPower();
+    const iMin = Math.max(0, idealPow - 0.055);
+    const iMax = Math.min(1, idealPow + 0.055);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
     ctx.fillRect(bx, by, bw, bh);
-    ctx.fillStyle = power < 0.4 ? '#44ff88' : power < 0.72 ? '#ffee44' : '#ff4444';
-    ctx.fillRect(bx, by, bw * power, bh);
-    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+
+    // 綠色理想區間
+    ctx.fillStyle = 'rgba(50,240,80,0.45)';
+    ctx.fillRect(bx + bw * iMin, by, bw * (iMax - iMin), bh);
+
+    // 當前蓄力
+    const diff = Math.abs(shootPower - idealPow);
+    ctx.fillStyle = diff < 0.07 ? '#44ff88' : shootPower < idealPow ? '#ffee44' : '#ff5533';
+    ctx.fillRect(bx, by, bw * shootPower, bh);
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
     ctx.lineWidth   = 1;
     ctx.strokeRect(bx, by, bw, bh);
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
     ctx.font = '11px Arial';
-    ctx.fillText('力道', bx + bw + 5, by + 11);
+    ctx.fillText('力道', bx + bw + 6, by + 11);
 }
 
 function drawHUD() {
-    // 計分板背景
     ctx.fillStyle   = 'rgba(0,0,0,0.52)';
     ctx.strokeStyle = 'rgba(255,140,0,0.4)';
     ctx.lineWidth   = 1;
@@ -556,12 +616,11 @@ function drawHUD() {
         ctx.fillText(`🔥 連續 ${streak} 球！`, 22, 102);
     }
 
-    // 操作提示
-    if (state === 'idle') {
+    if (state === 'idle' || state === 'charging') {
         ctx.fillStyle = 'rgba(255,220,100,0.72)';
-        ctx.font      = '14px Arial';
+        ctx.font      = '13px Arial';
         ctx.textAlign = 'center';
-        ctx.fillText('點住籃球朝籃框方向拖曳，放開投出', W / 2, H - 10);
+        ctx.fillText('← → 移動   ↑ 跳躍   空白鍵按住蓄力放開投籃', W / 2, H - 10);
         ctx.textAlign = 'left';
     }
 }
@@ -592,7 +651,7 @@ function drawParticles() {
     ctx.globalAlpha = 1;
 }
 
-// ── 手臂 IK 求解（讓手臂自然伸向目標）──────────────────────
+// ── 手臂 IK 求解 ─────────────────────────────────────────────
 function solveIK(sx, sy, tx, ty, L1, L2, elbowCCW = false) {
     const dx  = tx - sx, dy = ty - sy;
     let   D   = Math.hypot(dx, dy);
@@ -606,15 +665,13 @@ function solveIK(sx, sy, tx, ty, L1, L2, elbowCCW = false) {
 
 // ── 人物繪製 ─────────────────────────────────────────────────
 function drawCharacter() {
-    const cx      = 90;
-    const fy      = H - 78;          // 地板 y = 412
-    const tp      = throwPhase;      // 0 持球 → 1 出手完成
-    const holding = state === 'idle' || state === 'aiming';
+    const cx     = player.x;
+    const fy     = FLOOR_Y + player.jumpOffset;
+    const tp     = throwPhase;
+    const holding = state === 'idle' || state === 'charging';
 
-    // 身體隨出手動作向前傾
-    const lean   = tp * 9;
-    // 膝蓋隨蓄力微彎（aiming 時透過 dragEnd 距離感知）
-    const kBend  = tp * 5;
+    const lean  = tp * 9;
+    const kBend = tp * 5;
 
     ctx.save();
     ctx.lineCap  = 'round';
@@ -630,7 +687,6 @@ function drawCharacter() {
         ctx.beginPath();
         ctx.ellipse(sx, fy + 4, 14, 6, tilt, 0, Math.PI * 2);
         ctx.fill(); ctx.stroke();
-        // 紅色品牌條紋
         ctx.strokeStyle = '#cc1111';
         ctx.lineWidth   = 1.5;
         ctx.beginPath();
@@ -639,17 +695,15 @@ function drawCharacter() {
         ctx.stroke();
     }
 
-    // ── 腿（quadratic curve 給膝蓋微彎感）─────────────────────
+    // ── 腿 ────────────────────────────────────────────────────
     ctx.strokeStyle = '#1a3acc';
     ctx.lineWidth   = 9;
     const hipX = cx + lean * 0.55, hipY = fy - 38;
-    // 左腿
     ctx.beginPath();
     ctx.moveTo(hipX - 5, hipY);
     ctx.quadraticCurveTo(cx - 16 + lean * 0.4 + kBend, fy - 18,
                          cx - 14 + lean * 0.28, fy);
     ctx.stroke();
-    // 右腿
     ctx.beginPath();
     ctx.moveTo(hipX + 6, hipY);
     ctx.quadraticCurveTo(cx + 16 + lean * 0.4 - kBend, fy - 18,
@@ -676,7 +730,6 @@ function drawCharacter() {
     ctx.lineTo(bx - 13, fy - 50);
     ctx.closePath();
     ctx.fill();
-    // 球衣號碼
     ctx.fillStyle   = '#fff';
     ctx.font        = 'bold 14px Arial';
     ctx.textAlign   = 'center';
@@ -689,17 +742,16 @@ function drawCharacter() {
     ctx.ellipse(bx, fy - 88, 5, 8, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // ── 頭部（出手後微微後仰，眼睛追蹤球）──────────────────
+    // ── 頭部 ──────────────────────────────────────────────────
     const headX   = bx + 2;
     const headY   = fy - 105 + tp * 2;
-    const eyeRise = tp * 3;   // 出手後眼睛往上看
+    const eyeRise = tp * 3;
 
     ctx.fillStyle = '#c8834a';
     ctx.beginPath();
     ctx.arc(headX, headY, 15, 0, Math.PI * 2);
     ctx.fill();
 
-    // 頭髮
     ctx.fillStyle = '#1a1a1a';
     ctx.beginPath();
     ctx.arc(headX, headY, 14.5, Math.PI * 1.05, Math.PI * -0.02);
@@ -707,7 +759,6 @@ function drawCharacter() {
     ctx.closePath();
     ctx.fill();
 
-    // 眼睛
     ctx.fillStyle = '#222';
     ctx.beginPath(); ctx.arc(headX + 3, headY - eyeRise + 2, 2.5, 0, Math.PI*2); ctx.fill();
     ctx.beginPath(); ctx.arc(headX + 9, headY - eyeRise + 2, 2.5, 0, Math.PI*2); ctx.fill();
@@ -717,7 +768,6 @@ function drawCharacter() {
 
     // ── 左臂（平衡臂）────────────────────────────────────────
     const lSX = bx - 16, lSY = fy - 83;
-    // holding: 輕微向前下托住球；follow-through: 向外後伸保持平衡
     const lUAng = holding
         ? lerp(Math.PI * 0.68, Math.PI * 0.58, tp)
         : lerp(Math.PI * 0.68, Math.PI * 0.85, tp);
@@ -735,16 +785,14 @@ function drawCharacter() {
     ctx.lineTo(lHX, lHY);
     ctx.stroke();
 
-    // ── 右臂（投球臂，IK 精準持球 + lerp 到出手姿勢）────────
+    // ── 右臂（投球臂，IK 持球 → 出手 lerp）───────────────────
     const rSX = bx + 16, rSY = fy - 84;
     const L1 = 24, L2 = 21;
 
-    // --- 持球姿勢：IK 讓手抵達 ORIGIN ---
-    const ik = solveIK(rSX, rSY, ORIGIN.x, ORIGIN.y, L1, L2, false);
+    const ik = solveIK(rSX, rSY, ball.x, ball.y, L1, L2, false);
     const hold_eX = ik.ex, hold_eY = ik.ey;
-    const hold_hX = ORIGIN.x, hold_hY = ORIGIN.y;
+    const hold_hX = ball.x, hold_hY = ball.y;
 
-    // --- 出手姿勢：手臂向右上完全舒展 ---
     const ftUA  = -Math.PI * 0.50;
     const ftLA  = -Math.PI * 0.22;
     const ft_eX = rSX + Math.cos(ftUA) * L1;
@@ -752,7 +800,6 @@ function drawCharacter() {
     const ft_hX = ft_eX + Math.cos(ftLA) * L2;
     const ft_hY = ft_eY + Math.sin(ftLA) * L2;
 
-    // 用 smoothstep 讓動作曲線更自然
     const s   = tp * tp * (3 - 2 * tp);
     const rEX = lerp(hold_eX, ft_eX, s);
     const rEY = lerp(hold_eY, ft_eY, s);
@@ -788,71 +835,6 @@ function loop() {
     render();
     requestAnimationFrame(loop);
 }
-
-// ── 輸入事件（滑鼠）────────────────────────────────────────
-canvas.addEventListener('mousedown', e => {
-    if (state !== 'idle') return;
-    const p = getPos(e);
-    if (Math.hypot(p.x - ball.x, p.y - ball.y) < BALL_R * 3.8) {
-        dragEnd = { ...p };
-        state   = 'aiming';
-    }
-});
-
-canvas.addEventListener('mousemove', e => {
-    if (state !== 'aiming') return;
-    dragEnd = getPos(e);
-});
-
-canvas.addEventListener('mouseup', () => {
-    if (state !== 'aiming') return;
-    const vel = dragVelocity();
-    if (Math.hypot(vel.vx, vel.vy) > 1.5) {
-        ball.vx  = vel.vx;
-        ball.vy  = vel.vy;
-        prevBallY = ball.y;
-        state    = 'flying';
-    } else {
-        state = 'idle';
-    }
-    dragEnd = null;
-});
-
-canvas.addEventListener('mouseleave', () => {
-    if (state === 'aiming') { state = 'idle'; dragEnd = null; }
-});
-
-// ── 輸入事件（觸控）────────────────────────────────────────
-canvas.addEventListener('touchstart', e => {
-    e.preventDefault();
-    if (state !== 'idle') return;
-    const p = getPos(e.touches[0]);
-    if (Math.hypot(p.x - ball.x, p.y - ball.y) < BALL_R * 4.5) {
-        dragEnd = { ...p };
-        state   = 'aiming';
-    }
-}, { passive: false });
-
-canvas.addEventListener('touchmove', e => {
-    e.preventDefault();
-    if (state !== 'aiming') return;
-    dragEnd = getPos(e.touches[0]);
-}, { passive: false });
-
-canvas.addEventListener('touchend', e => {
-    e.preventDefault();
-    if (state !== 'aiming') return;
-    const vel = dragVelocity();
-    if (Math.hypot(vel.vx, vel.vy) > 1.5) {
-        ball.vx   = vel.vx;
-        ball.vy   = vel.vy;
-        prevBallY = ball.y;
-        state     = 'flying';
-    } else {
-        state = 'idle';
-    }
-    dragEnd = null;
-}, { passive: false });
 
 // ── 啟動 ─────────────────────────────────────────────────────
 resetBall();
